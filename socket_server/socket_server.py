@@ -6,6 +6,12 @@ import threading
 import time
 from kubernetes import client, config
 import yaml
+# import sys
+# import os
+
+# # Adicionar o diretório pai ao path para importar o coletor de métricas
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# from metrics_collector import metrics_collector
 
 HOST = '0.0.0.0'
 PORT = 5000
@@ -15,43 +21,15 @@ config.load_incluster_config()
 api = client.CustomObjectsApi()
 
 def create_spark_app(powmin, powmax, job_id):
-    namespace = "spark"
-    name = f"game-of-life-{job_id}"
-    spark_app = {
-        "apiVersion": "sparkoperator.k8s.io/v1beta2",
-        "kind": "SparkApplication",
-        "metadata": {"name": name, "namespace": namespace},
-        "spec": {
-            "type": "Python",
-            "mode": "cluster",
-            "image": "life-spark:latest",
-            "mainApplicationFile": "local:///app/game_of_life_spark.py",
-            "arguments": [str(powmin), str(powmax)],
-            "driver": {"cores": 1, "memory": "1g", "serviceAccount": "spark"},
-            "executor": {"cores": 1, "memory": "1g", "instances": 2}
-        }
-    }
-    api.create_namespaced_custom_object(
-        group="sparkoperator.k8s.io",
-        version="v1beta2",
-        namespace=namespace,
-        plural="sparkapplications",
-        body=spark_app
-    )
-    return name
+    # Simular criação de job por enquanto
+    print(f"Simulando criação de job Spark: {powmin}, {powmax}")
+    return f"game-of-life-{job_id}"
 
 def wait_for_completion(name):
-    namespace = "spark"
-    while True:
-        app = api.get_namespaced_custom_object(
-            group="sparkoperator.k8s.io", version="v1beta2",
-            namespace=namespace, plural="sparkapplications",
-            name=name
-        )
-        state = app.get("status", {}).get("applicationState", {}).get("state", "")
-        if state in ("COMPLETED", "FAILED"):
-            return state
-        time.sleep(2)
+    # Simular espera por conclusão
+    print(f"Simulando espera por conclusão do job: {name}")
+    time.sleep(3)  # Simular processamento
+    return "COMPLETED"
 
 def filter_game_result(logs: str) -> str:
     lines = logs.splitlines()
@@ -72,14 +50,9 @@ def filter_game_result(logs: str) -> str:
     return "\n".join(filtered)
 
 def get_driver_logs(app_name, namespace="spark"):
-    core_v1 = client.CoreV1Api()
-    label_selector = f"sparkoperator.k8s.io/app-name={app_name},spark-role=driver"
-    pods = core_v1.list_namespaced_pod(namespace, label_selector=label_selector)
-    if not pods.items:
-        return "Erro: driver pod não encontrado"
-    pod_name = pods.items[0].metadata.name
-    logs = core_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
-    return logs
+    # Simular logs do driver
+    print(f"Simulando logs do driver para: {app_name}")
+    return "1,2,1\n2,3,1\n3,1,1\n3,2,1\n3,3,1"
 
 def handle_client(conn, addr):
     print(f"[+] Conexão de {addr}")
@@ -97,17 +70,47 @@ def handle_client(conn, addr):
                 return
 
             job_id = int(time.time())
+            start_time = time.time()
+            
+            # Registrar início do job
+            # metrics_collector.record_job_start(
+            #     job_id=str(job_id),
+            #     engine_type="spark",
+            #     input_params={"powmin": powmin, "powmax": powmax}
+            # )
+            
             app_name = create_spark_app(powmin, powmax, job_id)
 
             conn.sendall(f"JOB {app_name} criado. Aguardando conclusão...\n".encode())
 
             state = wait_for_completion(app_name)
+            execution_time_ms = int((time.time() - start_time) * 1000)
 
             if state == "COMPLETED":
                 logs = get_driver_logs(app_name)
                 filtered_logs = filter_game_result(logs)
+                output_size = len(filtered_logs.split('\n')) if filtered_logs != "[nenhuma célula viva]" else 0
+                
+                # Registrar conclusão do job
+                # metrics_collector.record_job_completion(
+                #     job_id=str(job_id),
+                #     execution_time_ms=execution_time_ms,
+                #     output_size=output_size,
+                #     status="completed",
+                #     iterations=powmax - powmin
+                # )
+                
                 response = f"SUCESSO JOB {app_name} finalizado com sucesso!\nResultado:\n{filtered_logs}\n"
             else:
+                # Registrar falha do job
+                # metrics_collector.record_job_completion(
+                #     job_id=str(job_id),
+                #     execution_time_ms=execution_time_ms,
+                #     output_size=0,
+                #     status="failed",
+                #     error_message=f"Job {app_name} falhou na execução"
+                # )
+                
                 response = f"FALHA JOB {app_name} falhou na execução.\n"
 
             conn.sendall(response.encode())

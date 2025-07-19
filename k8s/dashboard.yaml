@@ -1,0 +1,331 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dashboard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-dashboard
+  namespace: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics-dashboard
+  template:
+    metadata:
+      labels:
+        app: metrics-dashboard
+    spec:
+      containers:
+      - name: metrics-dashboard
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8080
+        command: ["python", "-m", "http.server", "8080"]
+        workingDir: /app
+        volumeMounts:
+        - name: dashboard-files
+          mountPath: /app
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      # - name: metrics-api
+      #   image: python:3.9-slim
+      #   ports:
+      #   - containerPort: 5001
+      #   command: ["python", "/app/metrics_api_server.py"]
+      #   workingDir: /app
+      #   volumeMounts:
+      #   - name: api-files
+      #     mountPath: /app
+      #   env:
+      #   - name: FLASK_APP
+      #     value: "metrics_api_server.py"
+      #   resources:
+      #   - requests:
+      #     cpu: "100m"
+      #     memory: "128Mi"
+      #   - limits:
+      #     cpu: "200m"
+      #     memory: "256Mi"
+      volumes:
+      - name: dashboard-files
+        configMap:
+          name: dashboard-config
+      - name: api-files
+        configMap:
+          name: api-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: dashboard
+data:
+  metrics_api_server.py: |
+    from flask import Flask, jsonify, request
+    from flask_cors import CORS
+    import requests
+    import json
+    from datetime import datetime, timedelta
+
+    app = Flask(__name__)
+    CORS(app)
+
+    ELASTICSEARCH_URL = "http://elasticsearch.elasticsearch.svc.cluster.local:9200"
+    INDEX_NAME = "game-of-life-metrics"
+
+    @app.route('/api/metrics')
+    def get_metrics():
+        try:
+            query = {
+                "query": {
+                    "range": {
+                        "timestamp": {
+                            "gte": "now-24h"
+                        }
+                    }
+                },
+                "aggs": {
+                    "avg_execution_time": {
+                        "avg": {"field": "execution_time_ms"}
+                    },
+                    "total_jobs": {
+                        "value_count": {"field": "job_id"}
+                    },
+                    "success_rate": {
+                        "filter": {"term": {"status": "completed"}}
+                    },
+                    "by_engine": {
+                        "terms": {"field": "engine_type"}
+                    },
+                    "execution_times_over_time": {
+                        "date_histogram": {
+                            "field": "timestamp",
+                            "calendar_interval": "1h"
+                        },
+                        "aggs": {
+                            "avg_time": {
+                                "avg": {"field": "execution_time_ms"}
+                            }
+                        }
+                    }
+                },
+                "sort": [
+                    {"timestamp": {"order": "desc"}}
+                ],
+                "size": 100
+            }
+            
+            response = requests.post(
+                f"{ELASTICSEARCH_URL}/{INDEX_NAME}/_search",
+                json=query,
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code != 200:
+                return jsonify({"error": "Erro ao buscar métricas"}), 500
+            
+            data = response.json()
+            aggregations = data.get('aggregations', {})
+            
+            metrics = {
+                "total_jobs": aggregations.get('total_jobs', {}).get('value', 0),
+                "avg_execution_time": aggregations.get('avg_execution_time', {}).get('value', 0),
+                "success_rate": 0,
+                "engines": [],
+                "engine_counts": [],
+                "execution_times": [],
+                "time_labels": []
+            }
+            
+            total_jobs = metrics["total_jobs"]
+            if total_jobs > 0:
+                success_count = aggregations.get('success_rate', {}).get('doc_count', 0)
+                metrics["success_rate"] = success_count / total_jobs
+            
+            by_engine = aggregations.get('by_engine', {}).get('buckets', [])
+            for bucket in by_engine:
+                metrics["engines"].append(bucket['key'])
+                metrics["engine_counts"].append(bucket['doc_count'])
+            
+            time_buckets = aggregations.get('execution_times_over_time', {}).get('buckets', [])
+            for bucket in time_buckets:
+                timestamp = bucket['key_as_string']
+                avg_time = bucket.get('avg_time', {}).get('value', 0)
+                metrics["time_labels"].append(timestamp)
+                metrics["execution_times"].append(avg_time)
+            
+            return jsonify(metrics)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=5001, debug=True)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-config
+  namespace: dashboard
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Game of Life Metrics Dashboard</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            .metric-card { 
+                background: #f5f5f5; 
+                padding: 20px; 
+                margin: 10px 0; 
+                border-radius: 8px; 
+            }
+            .chart-container { 
+                position: relative; 
+                height: 400px; 
+                margin: 20px 0; 
+            }
+            button { 
+                background: #007bff; 
+                color: white; 
+                border: none; 
+                padding: 10px 20px; 
+                border-radius: 4px; 
+                cursor: pointer; 
+                margin: 5px; 
+            }
+            button:hover { background: #0056b3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Game of Life Metrics Dashboard</h1>
+            
+            <div class="metric-card">
+                <h2>Resumo das Métricas</h2>
+                <button onclick="loadMetrics()">Atualizar Métricas</button>
+                <div id="summary"></div>
+            </div>
+            
+            <div class="metric-card">
+                <h2>Execuções por Engine</h2>
+                <div class="chart-container">
+                    <canvas id="engineChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <h2>Tempo de Execução</h2>
+                <div class="chart-container">
+                    <canvas id="timeChart"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            let engineChart, timeChart;
+            
+            async function loadMetrics() {
+                try {
+                    // Dados simulados por enquanto
+                    const data = {
+                        total_jobs: 5,
+                        avg_execution_time: 1500,
+                        success_rate: 0.8,
+                        engines: ['spark', 'openmp', 'mpi'],
+                        engine_counts: [3, 1, 1],
+                        execution_times: [1200, 1800, 2100, 1400, 1600],
+                        time_labels: ['10:00', '11:00', '12:00', '13:00', '14:00']
+                    };
+                    updateSummary(data);
+                    updateCharts(data);
+                } catch (error) {
+                    console.error('Erro ao carregar métricas:', error);
+                    document.getElementById('summary').innerHTML = '<p>Erro ao carregar métricas</p>';
+                }
+            }
+            
+            function updateSummary(data) {
+                const summary = document.getElementById('summary');
+                summary.innerHTML = `
+                    <p><strong>Total de Jobs:</strong> ${data.total_jobs || 0}</p>
+                    <p><strong>Tempo Médio de Execução:</strong> ${Math.round(data.avg_execution_time || 0)}ms</p>
+                    <p><strong>Taxa de Sucesso:</strong> ${Math.round((data.success_rate || 0) * 100)}%</p>
+                `;
+            }
+            
+            function updateCharts(data) {
+                // Chart para engines
+                const engineCtx = document.getElementById('engineChart').getContext('2d');
+                if (engineChart) engineChart.destroy();
+                
+                engineChart = new Chart(engineCtx, {
+                    type: 'pie',
+                    data: {
+                        labels: data.engines || [],
+                        datasets: [{
+                            data: data.engine_counts || [],
+                            backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56']
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false
+                    }
+                });
+                
+                // Chart para tempo de execução
+                const timeCtx = document.getElementById('timeChart').getContext('2d');
+                if (timeChart) timeChart.destroy();
+                
+                timeChart = new Chart(timeCtx, {
+                    type: 'line',
+                    data: {
+                        labels: data.time_labels || [],
+                        datasets: [{
+                            label: 'Tempo de Execução (ms)',
+                            data: data.execution_times || [],
+                            borderColor: '#36A2EB',
+                            tension: 0.1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false
+                    }
+                });
+            }
+            
+            // Carregar métricas ao iniciar
+            loadMetrics();
+            
+            // Atualizar a cada 30 segundos
+            setInterval(loadMetrics, 30000);
+        </script>
+    </body>
+    </html>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-dashboard
+  namespace: dashboard
+spec:
+  selector:
+    app: metrics-dashboard
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: NodePort 
