@@ -1,134 +1,160 @@
-# server.py
-
 import socket
-import subprocess
 import threading
 import time
+import re
 from kubernetes import client, config
-import yaml
 
-HOST = '0.0.0.0'
-PORT = 5000
-
-# Carregar configuração dentro do cluster
+# --- Configuração ---
+HOST, PORT = '0.0.0.0', 5000
 config.load_incluster_config()
 api = client.CustomObjectsApi()
 
 def create_spark_app(powmin, powmax, job_id):
-    namespace = "spark"
-    name = f"game-of-life-{job_id}"
-    spark_app = {
-        "apiVersion": "sparkoperator.k8s.io/v1beta2",
-        "kind": "SparkApplication",
-        "metadata": {"name": name, "namespace": namespace},
-        "spec": {
-            "type": "Python",
-            "mode": "cluster",
-            "image": "life-spark:latest",
-            "mainApplicationFile": "local:///app/game_of_life_spark.py",
-            "arguments": [str(powmin), str(powmax)],
-            "driver": {"cores": 1, "memory": "1g", "serviceAccount": "spark"},
-            "executor": {"cores": 1, "memory": "1g", "instances": 2}
+    """Cria a especificação da SparkApplication e a submete ao K8s."""
+
+    spec = {
+      "apiVersion": "sparkoperator.k8s.io/v1beta2",
+      "kind": "SparkApplication",
+      "metadata": {"name": f"gol-{job_id}", "namespace": "spark"},
+      "spec": {
+        "type": "Python",
+        "pythonVersion": "3",
+        "mode": "cluster",
+        "image": "life-spark:latest",
+        "imagePullPolicy": "IfNotPresent",
+        "mainApplicationFile": "local:///app/game_of_life_spark.py",
+        "sparkVersion": "3.5.1",
+        "arguments": [str(powmin), str(powmax)],
+        "driver": {
+            "cores": 1,
+            "memory": "1g", 
+            "serviceAccount": "spark"
+        },
+        "executor": {
+            "cores": 1,
+            "memory": "1g",
+            "instances": 1
         }
+      }
     }
+    # Submete o objeto customizado para o Spark Operator
     api.create_namespaced_custom_object(
         group="sparkoperator.k8s.io",
         version="v1beta2",
-        namespace=namespace,
+        namespace="spark",
         plural="sparkapplications",
-        body=spark_app
+        body=spec
     )
-    return name
+    return spec["metadata"]["name"]
 
-def wait_for_completion(name):
-    namespace = "spark"
-    while True:
-        app = api.get_namespaced_custom_object(
-            group="sparkoperator.k8s.io", version="v1beta2",
-            namespace=namespace, plural="sparkapplications",
-            name=name
-        )
-        state = app.get("status", {}).get("applicationState", {}).get("state", "")
-        if state in ("COMPLETED", "FAILED"):
-            return state
-        time.sleep(2)
+def wait_for_completion(name, timeout=600, interval=10):
+    """Aguarda a conclusão de um SparkApplication, verificando seu status."""
+    print(f"Aguardando job '{name}'...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            app = api.get_namespaced_custom_object(
+                group="sparkoperator.k8s.io",
+                version="v1beta2",
+                namespace="spark",
+                plural="sparkapplications",
+                name=name
+            )
+            state = app.get("status", {}).get("applicationState", {}).get("state", "SUBMITTED")
+            print(f"Job '{name}' está no estado: {state}")
+            if state in ("COMPLETED", "FAILED"):
+                return state
+        except client.ApiException as e:
+            if e.status == 404:
+                print(f"Job '{name}' não encontrado, aguardando criação...")
+            else:
+                raise e # Lança outras exceções da API
+        time.sleep(interval)
+    raise TimeoutError(f"Timeout de {timeout}s atingido para o job SparkApplication '{name}'")
 
-def filter_game_result(logs: str) -> str:
-    lines = logs.splitlines()
-    filtered = []
-    for line in lines:
-        line = line.strip()
-        # verificar se linha tem o formato x,y,1 (3 valores, último é 1, x e y inteiros)
-        parts = line.split(",")
-        if len(parts) == 3 and parts[2] == "1":
-            try:
-                x = int(parts[0])
-                y = int(parts[1])
-                filtered.append(line)
-            except ValueError:
-                pass
-    if not filtered:
-        return "[nenhuma célula viva]"
-    return "\n".join(filtered)
+def get_driver_logs(app_name):
+    """Obtém os logs do pod do driver de uma aplicação Spark."""
+    v1 = client.CoreV1Api()
+    # O label selector padrão usado pelo Spark Operator
+    selector = f"sparkoperator.k8s.io/app-name={app_name},spark-role=driver"
+    try:
+        pods = v1.list_namespaced_pod("spark", label_selector=selector, timeout_seconds=60).items
+        if not pods:
+            return f"[ERRO] Nenhum pod de driver encontrado para o job '{app_name}'."
+        # Pega o primeiro pod encontrado (só deve haver um)
+        driver_pod_name = pods[0].metadata.name
+        print(f"Encontrado pod do driver: {driver_pod_name}")
+        # Lê os logs do container principal do pod
+        return v1.read_namespaced_pod_log(driver_pod_name, "spark")
+    except Exception as e:
+        return f"[ERRO] Falha ao obter logs do driver para '{app_name}': {e}"
 
-def get_driver_logs(app_name, namespace="spark"):
-    core_v1 = client.CoreV1Api()
-    label_selector = f"sparkoperator.k8s.io/app-name={app_name},spark-role=driver"
-    pods = core_v1.list_namespaced_pod(namespace, label_selector=label_selector)
-    if not pods.items:
-        return "Erro: driver pod não encontrado"
-    pod_name = pods.items[0].metadata.name
-    logs = core_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
-    return logs
+def filter_game_result(logs):
+    """Extrai os blocos de resultado do log completo do Spark."""
+    output_lines = []
+
+    start_marker = re.compile(r"^--- Análise para tam=\d+ ---")
+    
+    analysis_blocks = start_marker.split(logs)
+
+    # O primeiro elemento é o que vem antes do primeiro marcador, então o ignoramos.
+    for block in analysis_blocks[1:]:
+        # Remonta o bloco com seu marcador original
+        full_block = "--- Análise para tam=" + block
+        output_lines.append(full_block.strip())
+
+    if not output_lines:
+        return "[Nenhum bloco de resultado encontrado nos logs]"
+        
+    return "\n\n".join(output_lines)
 
 def handle_client(conn, addr):
+    """Lida com uma conexão de cliente individualmente."""
     print(f"[+] Conexão de {addr}")
-    with conn:
-        try:
-            data = conn.recv(1024)
-            if not data:
-                conn.sendall(b"Erro: Nenhum dado recebido.\n")
-                return
-
-            try:
-                powmin, powmax = map(int, data.decode().strip().split(","))
-            except ValueError:
-                conn.sendall(b"Erro: Formato invalido. Use: inteiro,inteiro\n")
-                return
-
-            job_id = int(time.time())
-            app_name = create_spark_app(powmin, powmax, job_id)
-
-            conn.sendall(f"JOB {app_name} criado. Aguardando conclusão...\n".encode())
-
-            state = wait_for_completion(app_name)
-
-            if state == "COMPLETED":
-                logs = get_driver_logs(app_name)
-                filtered_logs = filter_game_result(logs)
-                response = f"SUCESSO JOB {app_name} finalizado com sucesso!\nResultado:\n{filtered_logs}\n"
-            else:
-                response = f"FALHA JOB {app_name} falhou na execução.\n"
-
+    try:
+        data = conn.recv(1024).decode().strip()
+        if not re.match(r"^\d+,\d+$", data):
+            raise ValueError("Formato inválido")
+        powmin, powmax = map(int, data.split(","))
+        
+        job_id = int(time.time())
+        name = create_spark_app(powmin, powmax, job_id)
+        conn.sendall(f"JOB {name} criado, aguardando...\n".encode())
+        
+        state = wait_for_completion(name)
+        
+        print(f"Job '{name}' finalizou com estado: {state}")
+        logs = get_driver_logs(name)
+        
+        if state != "COMPLETED":
+            # MELHORIA: Envia os logs de erro para o cliente para depuração
+            response = f"Job {name} falhou com estado '{state}'.\n\n--- LOGS DE ERRO ---\n{logs}"
             conn.sendall(response.encode())
+        else:
+            # CORREÇÃO: Usa o resultado filtrado ao invés dos logs completos
+            result_block = filter_game_result(logs)
+            conn.sendall(result_block.encode())
 
-        except Exception as e:
-            error_msg = f"Erro interno do servidor: {str(e)}\n"
-            conn.sendall(error_msg.encode())
-            print(f"[!] Erro com {addr}: {e}")
-        finally:
-            print(f"[-] Desconectado {addr}")
+    except TimeoutError as e:
+        conn.sendall(f"[ERRO] {e}\n".encode())
+    except Exception as e:
+        conn.sendall(f"[ERRO] Falha no servidor: {e}\n".encode())
+    finally:
+        conn.close()
+        print(f"[-] Desconectado {addr}")
 
 def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind((HOST, PORT))
-    srv.listen()
-    print(f"[+] Servidor escutando {HOST}:{PORT}")
-
+    """Função principal do servidor."""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((HOST, PORT))
+    server_socket.listen()
+    print(f"[+] Servidor escutando em {HOST}:{PORT}")
+    
     while True:
-        conn, addr = srv.accept()
-        t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-        t.start()
+        client_conn, client_addr = server_socket.accept()
+        # Inicia uma nova thread para cada cliente
+        thread = threading.Thread(target=handle_client, args=(client_conn, client_addr), daemon=True)
+        thread.start()
 
 if __name__ == "__main__":
     main()

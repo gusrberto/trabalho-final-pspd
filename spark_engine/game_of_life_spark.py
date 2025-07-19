@@ -1,55 +1,97 @@
 from pyspark.sql import SparkSession
 import sys
+import time
 
 def neighbors(cell):
-    x, y, state = cell
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            if dx or dy:
-                yield (x + dx, y + dy), 1
+    """Gera as 8 coordenadas vizinhas de uma célula."""
+    x, y = cell
+    return [(x + dx, y + dy)
+            for dx in [-1, 0, 1] for dy in [-1, 0, 1]
+            if dx != 0 or dy != 0]
 
-def parse_line(line):
-    # Recebe "x,y,state"
-    x, y, s = map(int, line.split(','))
-    return (x, y, s)
+def life_step_spark(live_cells_rdd):
+    """Executa uma geração do Jogo da Vida de forma distribuída."""
+    neighbor_counts = live_cells_rdd.flatMap(lambda cell: [(n, 1) for n in neighbors(cell)])
+    live_neighbor_sum = neighbor_counts.reduceByKey(lambda a, b: a + b)
+    currently_alive_rdd = live_cells_rdd.map(lambda cell: (cell, True))
+    joined_rdd = live_neighbor_sum.fullOuterJoin(currently_alive_rdd)
 
-def life_step(cells_rdd):
-    # cells_rdd: RDD[(x,y,state)]
-    neighbor_counts = (
-        cells_rdd.flatMap(neighbors)
-        .reduceByKey(lambda a, b: a + b)
-    )
-    alive = cells_rdd.filter(lambda c: c[2] == 1).map(lambda c: ((c[0],c[1]),1))
-    # União contagens
-    joined = neighbor_counts.fullOuterJoin(alive)
-    
-    def rule(item):
-        (x,y), (cnt, is_alive) = item
-        cnt = cnt or 0
-        is_alive = is_alive or 0
-        alive_next = 1 if (is_alive == 1 and cnt in (2,3)) or (is_alive == 0 and cnt == 3) else 0
-        return (x, y, alive_next)
-    
-    return joined.map(rule)
+    def apply_rules(cell_data):
+        _, (neighbor_count_opt, was_alive_opt) = cell_data
+        live_neighbors = neighbor_count_opt or 0
+        is_currently_alive = was_alive_opt is not None
+        if not is_currently_alive and live_neighbors == 3:
+            return True
+        if is_currently_alive and (live_neighbors == 2 or live_neighbors == 3):
+            return True
+        return False
+
+    return joined_rdd.filter(apply_rules).keys()
+
+def correto(cells, tam):
+    """Verifica se o resultado final corresponde ao padrão esperado."""
+    vivos = set(cells)
+    if len(vivos) != 5:
+        return False
+    alvo = {
+        (tam-2, tam-1), (tam-1, tam), (tam, tam-2), (tam, tam-1), (tam, tam)
+    }
+    return alvo.issubset(vivos)
+
+def main():
+    """Função principal da aplicação Spark."""
+
+    spark = SparkSession.builder.appName("GameOfLife").getOrCreate()
+    sc = spark.sparkContext
+    sc.setLogLevel("ERROR")
+
+    try:
+        powmin_str = sys.argv[-2]
+        powmax_str = sys.argv[-1]
+        powmin = int(powmin_str)
+        powmax = int(powmax_str)
+    except Exception as e:
+        print("ERRO: Nao foi possivel extrair powmin e powmax dos argumentos da linha de comando.", file=sys.stderr)
+        print(f"Argumentos recebidos (sys.argv): {sys.argv}", file=sys.stderr)
+        print(f"Detalhe do erro: {e}", file=sys.stderr)
+        spark.stop()
+        sys.exit(1)
+
+    print(f"Iniciando Game of Life para POWMIN = {powmin}, POWMAX = {powmax}")
+
+    for p in range(powmin, powmax + 1):
+        tam = 1 << p
+        print(f"--- Processando para tam={tam} ---")
+        
+        seed = [(1, 2), (2, 3), (3, 1), (3, 2), (3, 3)]
+        rdd = sc.parallelize(seed).cache()
+        
+        t0 = time.time()
+
+        num_generations = 4 * (tam - 3)
+        for _ in range(num_generations):
+            new_rdd = life_step_spark(rdd).cache()
+            # Forçar a materialização é importante
+            new_rdd.count()
+            rdd.unpersist()
+            rdd = new_rdd
+            
+        t1 = time.time()
+        
+        result = sorted(rdd.collect())
+        rdd.unpersist() # Limpa o último RDD
+        
+        print(f"--- Análise para tam={tam} ---")
+        print(f"Células vivas encontradas: {len(result)}")
+        
+        if correto(result, tam):
+            print("Resultado: **CORRETO** (padrão final esperado encontrado)")
+        else:
+            print("Resultado: **INCORRETO** (padrão final não encontrado)")
+            
+        print(f"Tempo total de processamento Spark: {t1-t0:.4f}s\n")
+
+    spark.stop()
 
 if __name__ == "__main__":
-    try:
-        powmin = int(sys.argv[-2])
-        powmax = int(sys.argv[-1])
-    except Exception:
-        raise ValueError(f"Esperava dois inteiros como os dois últimos args, mas recebi: {sys.argv}")
-
-    spark = SparkSession.builder.appName("GameOfLifeEngine").getOrCreate()
-    sc = spark.sparkContext
-    
-    seed = [(1,2,1), (2,3,1), (3,1,1), (3,2,1), (3,3,1)]
-    cells = sc.parallelize(seed)
-    
-    for _ in range(powmin, powmax):
-        cells = life_step(cells)
-    
-    result = cells.filter(lambda c: c[2] == 1).collect()
-    for x,y,_ in result:
-        print(f"{x},{y},1")
-    
-    spark.stop()
+    main()
