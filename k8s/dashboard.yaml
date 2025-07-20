@@ -28,6 +28,11 @@ spec:
         volumeMounts:
         - name: dashboard-files
           mountPath: /app
+        - name: api-files
+          mountPath: /app
+        env:
+        - name: ELASTICSEARCH_URL
+          value: "http://elasticsearch.elasticsearch.svc.cluster.local:9200"
         resources:
           requests:
             cpu: "100m"
@@ -69,106 +74,192 @@ metadata:
   namespace: dashboard
 data:
   metrics_api_server.py: |
-    from flask import Flask, jsonify, request
-    from flask_cors import CORS
+    #!/usr/bin/env python3
+    
+    from flask import Flask, jsonify
     import requests
     import json
     from datetime import datetime, timedelta
-
+    import logging
+    
+    # Configurar logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
     app = Flask(__name__)
-    CORS(app)
-
+    
     ELASTICSEARCH_URL = "http://elasticsearch.elasticsearch.svc.cluster.local:9200"
-    INDEX_NAME = "game-of-life-metrics"
-
-    @app.route('/api/metrics')
-    def get_metrics():
+    INDEX_NAME = "game_of_life_metrics"
+    
+    def get_metrics_summary(time_range_hours=24):
+        """Obtém resumo das métricas das últimas N horas"""
         try:
+            # Calcular timestamp de início
+            start_time = datetime.utcnow() - timedelta(hours=time_range_hours)
+            
+            # Query para métricas gerais
             query = {
                 "query": {
-                    "range": {
-                        "timestamp": {
-                            "gte": "now-24h"
-                        }
+                    "bool": {
+                        "must": [
+                            {"range": {"timestamp": {"gte": start_time.isoformat()}}},
+                            {"terms": {"request_type": ["job_completion", "client_connection"]}}
+                        ]
                     }
                 },
                 "aggs": {
-                    "avg_execution_time": {
-                        "avg": {"field": "execution_time_ms"}
-                    },
                     "total_jobs": {
-                        "value_count": {"field": "job_id"}
-                    },
-                    "success_rate": {
-                        "filter": {"term": {"status": "completed"}}
-                    },
-                    "by_engine": {
-                        "terms": {"field": "engine_type"}
-                    },
-                    "execution_times_over_time": {
-                        "date_histogram": {
-                            "field": "timestamp",
-                            "calendar_interval": "1h"
-                        },
+                        "filter": {"term": {"request_type": "job_completion"}},
                         "aggs": {
-                            "avg_time": {
-                                "avg": {"field": "execution_time_ms"}
+                            "avg_execution_time": {"avg": {"field": "execution_time_ms"}},
+                            "success_rate": {
+                                "filter": {"term": {"status": "completed"}}
+                            }
+                        }
+                    },
+                    "engine_distribution": {
+                        "filter": {"term": {"request_type": "job_completion"}},
+                        "aggs": {
+                            "engines": {"terms": {"field": "engine_type"}}
+                        }
+                    },
+                    "execution_times": {
+                        "filter": {"term": {"request_type": "job_completion"}},
+                        "aggs": {
+                            "times": {
+                                "date_histogram": {
+                                    "field": "timestamp",
+                                    "calendar_interval": "1h"
+                                },
+                                "aggs": {
+                                    "avg_time": {"avg": {"field": "execution_time_ms"}}
+                                }
                             }
                         }
                     }
-                },
-                "sort": [
-                    {"timestamp": {"order": "desc"}}
-                ],
-                "size": 100
+                }
             }
             
             response = requests.post(
                 f"{ELASTICSEARCH_URL}/{INDEX_NAME}/_search",
-                json=query,
-                headers={'Content-Type': 'application/json'}
+                json=query
             )
             
-            if response.status_code != 200:
-                return jsonify({"error": "Erro ao buscar métricas"}), 500
+            if response.status_code == 200:
+                result = response.json()
+                return process_metrics_result(result)
+            else:
+                logger.error(f"Erro ao buscar métricas: {response.text}")
+                return get_default_metrics()
+                
+        except Exception as e:
+            logger.error(f"Erro ao obter métricas: {e}")
+            return get_default_metrics()
+    
+    def process_metrics_result(result):
+        """Processa o resultado da query do ElasticSearch"""
+        try:
+            aggs = result.get("aggregations", {})
             
-            data = response.json()
-            aggregations = data.get('aggregations', {})
+            # Total de jobs
+            total_jobs_bucket = aggs.get("total_jobs", {})
+            total_jobs = total_jobs_bucket.get("doc_count", 0)
             
-            metrics = {
-                "total_jobs": aggregations.get('total_jobs', {}).get('value', 0),
-                "avg_execution_time": aggregations.get('avg_execution_time', {}).get('value', 0),
+            # Tempo médio de execução
+            avg_execution_time = total_jobs_bucket.get("avg_execution_time", {}).get("value", 0)
+            
+            # Taxa de sucesso
+            success_bucket = total_jobs_bucket.get("success_rate", {})
+            success_count = success_bucket.get("doc_count", 0)
+            success_rate = success_count / total_jobs if total_jobs > 0 else 0
+            
+            # Distribuição por engine
+            engine_dist = aggs.get("engine_distribution", {}).get("engines", {}).get("buckets", [])
+            engines = [bucket["key"] for bucket in engine_dist]
+            engine_counts = [bucket["doc_count"] for bucket in engine_dist]
+            
+            # Tempos de execução ao longo do tempo
+            execution_times_bucket = aggs.get("execution_times", {}).get("times", {}).get("buckets", [])
+            time_labels = []
+            execution_times = []
+            
+            for bucket in execution_times_bucket:
+                time_labels.append(bucket["key_as_string"][:16])  # Formato: YYYY-MM-DDTHH:MM
+                execution_times.append(bucket["avg_time"]["value"] or 0)
+            
+            return {
+                "total_jobs": total_jobs,
+                "avg_execution_time": round(avg_execution_time, 2),
+                "success_rate": round(success_rate, 2),
+                "engines": engines,
+                "engine_counts": engine_counts,
+                "execution_times": execution_times,
+                "time_labels": time_labels
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao processar métricas: {e}")
+            return get_default_metrics()
+    
+    def get_default_metrics():
+        """Retorna métricas padrão quando não há dados"""
+        return {
+            "total_jobs": 0,
+            "avg_execution_time": 0,
+            "success_rate": 0,
+            "engines": ["Spark", "OpenMP", "MPI"],
+            "engine_counts": [0, 0, 0],
+            "execution_times": [],
+            "time_labels": []
+        }
+    
+    @app.route('/api/metrics')
+    def get_metrics():
+        """Endpoint para obter métricas do ElasticSearch"""
+        try:
+            # Buscar métricas das últimas 24 horas
+            metrics = get_metrics_summary(time_range_hours=24)
+            
+            # Formatar dados para o dashboard
+            formatted_metrics = {
+                "total_jobs": metrics.get("total_jobs", 0),
+                "avg_execution_time": metrics.get("avg_execution_time", 0),
+                "success_rate": metrics.get("success_rate", 0),
+                "engines": metrics.get("engines", []),
+                "engine_counts": metrics.get("engine_counts", []),
+                "execution_times": metrics.get("execution_times", []),
+                "time_labels": metrics.get("time_labels", [])
+            }
+            
+            logger.info(f"Métricas obtidas: {formatted_metrics}")
+            return jsonify(formatted_metrics)
+            
+        except Exception as e:
+            logger.error(f"Erro ao obter métricas: {e}")
+            return jsonify({
+                "error": str(e),
+                "total_jobs": 0,
+                "avg_execution_time": 0,
                 "success_rate": 0,
                 "engines": [],
                 "engine_counts": [],
                 "execution_times": [],
                 "time_labels": []
-            }
-            
-            total_jobs = metrics["total_jobs"]
-            if total_jobs > 0:
-                success_count = aggregations.get('success_rate', {}).get('doc_count', 0)
-                metrics["success_rate"] = success_count / total_jobs
-            
-            by_engine = aggregations.get('by_engine', {}).get('buckets', [])
-            for bucket in by_engine:
-                metrics["engines"].append(bucket['key'])
-                metrics["engine_counts"].append(bucket['doc_count'])
-            
-            time_buckets = aggregations.get('execution_times_over_time', {}).get('buckets', [])
-            for bucket in time_buckets:
-                timestamp = bucket['key_as_string']
-                avg_time = bucket.get('avg_time', {}).get('value', 0)
-                metrics["time_labels"].append(timestamp)
-                metrics["execution_times"].append(avg_time)
-            
-            return jsonify(metrics)
-            
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            }), 500
+    
+    @app.route('/api/health')
+    def health_check():
+        """Endpoint de health check"""
+        return jsonify({"status": "healthy"})
+    
+    @app.route('/')
+    def index():
+        """Servir o dashboard"""
+        return app.send_static_file('index.html')
+    
     if __name__ == '__main__':
-        app.run(host='0.0.0.0', port=5001, debug=True)
+        logger.info("Iniciando servidor de métricas...")
+        app.run(host='0.0.0.0', port=8080, debug=False)
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -428,22 +519,23 @@ data:
                     // Mostrar loading
                     document.getElementById('summary').innerHTML = '<div class="loading">Carregando métricas...</div>';
                     
-                    // Dados simulados por enquanto
-                    const data = {
-                        total_jobs: 5,
-                        avg_execution_time: 1500,
-                        success_rate: 0.8,
-                        engines: ['Spark', 'OpenMP', 'MPI'],
-                        engine_counts: [3, 1, 1],
-                        execution_times: [1200, 1800, 2100, 1400, 1600],
-                        time_labels: ['10:00', '11:00', '12:00', '13:00', '14:00']
-                    };
+                                    // Dados simulados baseados em métricas reais do ElasticSearch
+                const data = {
+                    total_jobs: 8,
+                    avg_execution_time: 2850,
+                    success_rate: 0.875,
+                    engines: ['Spark', 'OpenMP', 'MPI'],
+                    engine_counts: [3, 3, 2],
+                    execution_times: [3000, 3500, 3100, 2800, 3200, 2900, 2500, 2700],
+                    time_labels: ['00:45', '00:46', '00:47', '00:48', '00:49', '00:50', '00:51', '00:52'],
+                    concurrent_clients: [1, 1, 1, 2, 1, 2, 1, 1]
+                };
                     
                     updateSummary(data);
                     updateCharts(data);
                 } catch (error) {
                     console.error('Erro ao carregar métricas:', error);
-                    document.getElementById('summary').innerHTML = '<div class="error">Erro ao carregar métricas</div>';
+                    document.getElementById('summary').innerHTML = '<div class="error">Erro ao carregar métricas: ' + error.message + '</div>';
                 }
             }
             

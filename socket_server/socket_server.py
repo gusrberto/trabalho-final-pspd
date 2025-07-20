@@ -4,14 +4,14 @@ import socket
 import subprocess
 import threading
 import time
+import sys
+import os
 from kubernetes import client, config
 import yaml
-# import sys
-# import os
 
-# # Adicionar o diretório pai ao path para importar o coletor de métricas
-# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# from metrics_collector import metrics_collector
+# Adicionar o diretório pai ao path para importar o coletor de métricas
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from metrics_collector import metrics_collector
 
 HOST = '0.0.0.0'
 PORT = 5000
@@ -55,7 +55,15 @@ def get_driver_logs(app_name, namespace="spark"):
     return "1,2,1\n2,3,1\n3,1,1\n3,2,1\n3,3,1"
 
 def handle_client(conn, addr):
-    print(f"[+] Conexão de {addr}")
+    client_id = f"{addr[0]}:{addr[1]}"
+    print(f"[+] Conexão de {client_id}")
+    
+    # Registrar conexão do cliente
+    try:
+        metrics_collector.record_client_connection(client_id)
+    except Exception as e:
+        print(f"[!] Erro ao registrar conexão: {e}")
+    
     with conn:
         try:
             data = conn.recv(1024)
@@ -73,11 +81,15 @@ def handle_client(conn, addr):
             start_time = time.time()
             
             # Registrar início do job
-            # metrics_collector.record_job_start(
-            #     job_id=str(job_id),
-            #     engine_type="spark",
-            #     input_params={"powmin": powmin, "powmax": powmax}
-            # )
+            try:
+                metrics_collector.record_job_start(
+                    client_id=client_id,
+                    engine_type="spark",
+                    grid_size=powmax - powmin,
+                    iterations=powmax - powmin
+                )
+            except Exception as e:
+                print(f"[!] Erro ao registrar início do job: {e}")
             
             app_name = create_spark_app(powmin, powmax, job_id)
 
@@ -92,24 +104,32 @@ def handle_client(conn, addr):
                 output_size = len(filtered_logs.split('\n')) if filtered_logs != "[nenhuma célula viva]" else 0
                 
                 # Registrar conclusão do job
-                # metrics_collector.record_job_completion(
-                #     job_id=str(job_id),
-                #     execution_time_ms=execution_time_ms,
-                #     output_size=output_size,
-                #     status="completed",
-                #     iterations=powmax - powmin
-                # )
+                try:
+                    metrics_collector.record_job_completion(
+                        client_id=client_id,
+                        engine_type="spark",
+                        execution_time_ms=execution_time_ms,
+                        status="completed",
+                        grid_size=powmax - powmin,
+                        iterations=powmax - powmin
+                    )
+                except Exception as e:
+                    print(f"[!] Erro ao registrar conclusão do job: {e}")
                 
                 response = f"SUCESSO JOB {app_name} finalizado com sucesso!\nResultado:\n{filtered_logs}\n"
             else:
                 # Registrar falha do job
-                # metrics_collector.record_job_completion(
-                #     job_id=str(job_id),
-                #     execution_time_ms=execution_time_ms,
-                #     output_size=0,
-                #     status="failed",
-                #     error_message=f"Job {app_name} falhou na execução"
-                # )
+                try:
+                    metrics_collector.record_job_completion(
+                        client_id=client_id,
+                        engine_type="spark",
+                        execution_time_ms=execution_time_ms,
+                        status="failed",
+                        grid_size=powmax - powmin,
+                        iterations=powmax - powmin
+                    )
+                except Exception as e:
+                    print(f"[!] Erro ao registrar falha do job: {e}")
                 
                 response = f"FALHA JOB {app_name} falhou na execução.\n"
 
@@ -118,9 +138,15 @@ def handle_client(conn, addr):
         except Exception as e:
             error_msg = f"Erro interno do servidor: {str(e)}\n"
             conn.sendall(error_msg.encode())
-            print(f"[!] Erro com {addr}: {e}")
+            print(f"[!] Erro com {client_id}: {e}")
         finally:
-            print(f"[-] Desconectado {addr}")
+            # Registrar desconexão do cliente
+            try:
+                metrics_collector.record_client_disconnection(client_id)
+            except Exception as e:
+                print(f"[!] Erro ao registrar desconexão: {e}")
+            
+            print(f"[-] Desconectado {client_id}")
 
 def main():
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
