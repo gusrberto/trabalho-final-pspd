@@ -1,0 +1,35 @@
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential openmpi-bin libopenmpi-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY life_mpi_omp.c .
+RUN mpicc -fopenmp life_mpi_omp.c -o life_mpi_omp
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    openmpi-bin libopenmpi-dev openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+
+# Cria o usuário com UID 1000 para evitar erro de "No user exists"
+RUN useradd -m -u 1000 mpiuser
+
+# Cria o arquivo de configuração SSH para usar porta 2222
+RUN mkdir -p /home/mpiuser/.ssh \
+ && echo -e "Host *\n    Port 2222\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null" > /home/mpiuser/.ssh/config \
+ && chown -R mpiuser:mpiuser /home/mpiuser/.ssh
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER mpiuser
+
+WORKDIR /app
+COPY --from=builder /app/life_mpi_omp .
+ENV PATH="/app:${PATH}"
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

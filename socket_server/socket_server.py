@@ -1,13 +1,13 @@
 import socket
 import threading
 import time
-import re
 from kubernetes import client, config
 
 # --- Configuração ---
 HOST, PORT = '0.0.0.0', 5000
 config.load_incluster_config()
-api = client.CustomObjectsApi()
+custom_api = client.CustomObjectsApi()
+core_api = client.CoreV1Api()
 
 def create_spark_app(powmin, powmax, job_id):
     """Cria a especificação da SparkApplication e a submete ao K8s."""
@@ -38,7 +38,7 @@ def create_spark_app(powmin, powmax, job_id):
       }
     }
     # Submete o objeto customizado para o Spark Operator
-    api.create_namespaced_custom_object(
+    custom_api.create_namespaced_custom_object(
         group="sparkoperator.k8s.io",
         version="v1beta2",
         namespace="spark",
@@ -47,99 +47,172 @@ def create_spark_app(powmin, powmax, job_id):
     )
     return spec["metadata"]["name"]
 
-def wait_for_completion(name, timeout=600, interval=10):
-    """Aguarda a conclusão de um SparkApplication, verificando seu status."""
-    print(f"Aguardando job '{name}'...")
+def create_mpi_job(powmin, powmax, job_id, num_workers=2):
+    name = f"gol-mpi-{job_id}"
+    spec = {
+      "apiVersion": "kubeflow.org/v2beta1",
+      "kind": "MPIJob",
+      "metadata": {"name": name, "namespace": "default"},
+      "spec": {
+        "slotsPerWorker": 1,
+        "runPolicy": {"cleanPodPolicy": "Running"},
+        "sshAuthMountPath": "/home/mpiuser/.ssh",
+        "mpiReplicaSpecs": {
+          "Launcher": {
+            "replicas": 1,
+            "template": {
+              "spec": {
+                "serviceAccountName": "default",
+                "securityContext": {"runAsUser": 1000},
+                "volumes": [
+                  {
+                    "name": "ssh-config",
+                    "configMap": {
+                      "name": "ssh-config",
+                      "items": [
+                        {"key": "config", "path": "config"}
+                      ]
+                    }
+                  }
+                ],
+                "containers": [{
+                  "name": "mpi-launcher",
+                  "image": "life-mpi-launcher:latest",
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["mpirun"],
+                  "args": [
+                    "-n", str(num_workers),
+                    "/app/life_mpi_omp", str(powmin), str(powmax)
+                  ],
+                  "env": [
+                    {"name": "OMPI_MCA_plm_rsh_args", "value": "-p 2222"},
+                    {"name": "OMPI_MCA_orte_rsh_agent", "value": "ssh -F /etc/ssh_config_mpi/config"}
+                  ],
+                  "resources": {"limits": {"cpu": "1", "memory": "1Gi"}},
+                  "volumeMounts": [
+                    {
+                      "name": "ssh-config",
+                      "mountPath": "/etc/ssh_config_mpi/config",
+                      "subPath": "config"
+                    }
+                  ]
+                }]
+              }
+            }
+          },
+          "Worker": {
+            "replicas": num_workers,
+            "template": {
+              "spec": {
+                "serviceAccountName": "default",
+                "securityContext": {"runAsUser": 1000},
+                "containers": [{
+                  "name": "mpi-worker",
+                  "image": "life-mpi-worker:latest",
+                  "imagePullPolicy": "IfNotPresent",
+                  "command": ["/usr/sbin/sshd"],
+                  "args": ["-De", "-f", "/home/mpiuser/.sshd_config"],
+                  "ports": [{"containerPort": 2222}],
+                  "resources": {"limits": {"cpu": "1", "memory": "1Gi"}}
+                }]
+              }
+            }
+          }
+        }
+      }
+    }
+    custom_api.create_namespaced_custom_object(
+      group="kubeflow.org", version="v2beta1",
+      namespace="default", plural="mpijobs", body=spec
+    )
+    return name
+
+def wait_for_completion(name, namespace, group, version, plural, timeout=600):
+    """Aguarda a conclusão de um job (Spark ou MPI)."""
+    print(f"Aguardando job '{name}' em '{namespace}'...")
     start_time = time.time()
+    last_state = ""
     while time.time() - start_time < timeout:
         try:
-            app = api.get_namespaced_custom_object(
-                group="sparkoperator.k8s.io",
-                version="v1beta2",
-                namespace="spark",
-                plural="sparkapplications",
-                name=name
+            job = custom_api.get_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural, name=name
             )
-            state = app.get("status", {}).get("applicationState", {}).get("state", "SUBMITTED")
-            print(f"Job '{name}' está no estado: {state}")
-            if state in ("COMPLETED", "FAILED"):
+            state = ""
+            if plural == "sparkapplications":
+                state = job.get("status", {}).get("applicationState", {}).get("state", "SUBMITTED")
+            elif plural == "mpijobs":
+                conditions = job.get("status", {}).get("conditions", [])
+                if conditions: state = conditions[-1].get("type", "RUNNING")
+
+            if state != last_state:
+                print(f"Job '{name}' mudou para o estado: {state}")
+                last_state = state
+
+            if state in ("COMPLETED", "Succeeded", "FAILED", "Failed"):
                 return state
         except client.ApiException as e:
-            if e.status == 404:
-                print(f"Job '{name}' não encontrado, aguardando criação...")
-            else:
-                raise e # Lança outras exceções da API
-        time.sleep(interval)
-    raise TimeoutError(f"Timeout de {timeout}s atingido para o job SparkApplication '{name}'")
+            if e.status != 404: raise e
+        time.sleep(10)
+    raise TimeoutError(f"Timeout para o job '{name}'")
 
-def get_driver_logs(app_name):
-    """Obtém os logs do pod do driver de uma aplicação Spark."""
-    v1 = client.CoreV1Api()
-    # O label selector padrão usado pelo Spark Operator
-    selector = f"sparkoperator.k8s.io/app-name={app_name},spark-role=driver"
+def get_job_logs(name, namespace, label_selector_key):
+    """Obtém os logs do pod principal de um job (Spark Driver ou MPI Launcher)."""
+    print(f"Obtendo logs para o job '{name}'...")
+    selector = f"{label_selector_key}={name}"
+    pods = core_api.list_namespaced_pod(namespace, label_selector=selector).items
+    if not pods: return f"[ERRO] Nenhum pod principal encontrado para o job '{name}'."
+    pod_name = pods[0].metadata.name
+    return core_api.read_namespaced_pod_log(pod_name, namespace)
+
+def delete_job(name, namespace, group, version, plural):
+    """Deleta um job (Spark ou MPI) para limpeza."""
+    print(f"Limpando e deletando o job '{name}'...")
     try:
-        pods = v1.list_namespaced_pod("spark", label_selector=selector, timeout_seconds=60).items
-        if not pods:
-            return f"[ERRO] Nenhum pod de driver encontrado para o job '{app_name}'."
-        # Pega o primeiro pod encontrado (só deve haver um)
-        driver_pod_name = pods[0].metadata.name
-        print(f"Encontrado pod do driver: {driver_pod_name}")
-        # Lê os logs do container principal do pod
-        return v1.read_namespaced_pod_log(driver_pod_name, "spark")
-    except Exception as e:
-        return f"[ERRO] Falha ao obter logs do driver para '{app_name}': {e}"
-
-def filter_game_result(logs):
-    """Extrai os blocos de resultado do log completo do Spark."""
-    output_lines = []
-
-    start_marker = re.compile(r"^--- Análise para tam=\d+ ---")
-    
-    analysis_blocks = start_marker.split(logs)
-
-    # O primeiro elemento é o que vem antes do primeiro marcador, então o ignoramos.
-    for block in analysis_blocks[1:]:
-        # Remonta o bloco com seu marcador original
-        full_block = "--- Análise para tam=" + block
-        output_lines.append(full_block.strip())
-
-    if not output_lines:
-        return "[Nenhum bloco de resultado encontrado nos logs]"
-        
-    return "\n\n".join(output_lines)
+        # CORREÇÃO: Usando a variável correta 'custom_api'
+        custom_api.delete_namespaced_custom_object(
+            group=group, version=version, namespace=namespace, plural=plural, name=name
+        )
+    except client.ApiException as e:
+        if e.status != 404: print(f"[ERRO] Falha ao deletar job '{name}': {e}")
 
 def handle_client(conn, addr):
-    """Lida com uma conexão de cliente individualmente."""
     print(f"[+] Conexão de {addr}")
+    job_name, namespace, group, version, plural, log_label = "", "", "", "", "", ""
     try:
         data = conn.recv(1024).decode().strip()
-        if not re.match(r"^\d+,\d+$", data):
-            raise ValueError("Formato inválido")
-        powmin, powmax = map(int, data.split(","))
-        
+        parts = data.split(",")
+        engine = parts[0].strip().lower()
+        powmin, powmax = map(int, parts[1:])
         job_id = int(time.time())
-        name = create_spark_app(powmin, powmax, job_id)
-        conn.sendall(f"JOB {name} criado, aguardando...\n".encode())
-        
-        state = wait_for_completion(name)
-        
-        print(f"Job '{name}' finalizou com estado: {state}")
-        logs = get_driver_logs(name)
-        
-        if state != "COMPLETED":
-            # MELHORIA: Envia os logs de erro para o cliente para depuração
-            response = f"Job {name} falhou com estado '{state}'.\n\n--- LOGS DE ERRO ---\n{logs}"
-            conn.sendall(response.encode())
-        else:
-            # CORREÇÃO: Usa o resultado filtrado ao invés dos logs completos
-            result_block = filter_game_result(logs)
-            conn.sendall(result_block.encode())
 
-    except TimeoutError as e:
-        conn.sendall(f"[ERRO] {e}\n".encode())
+        if engine == "spark":
+            namespace, group, version, plural = "spark", "sparkoperator.k8s.io", "v1beta2", "sparkapplications"
+            log_label = "sparkoperator.k8s.io/app-name"
+            job_name = create_spark_app(powmin, powmax, job_id)
+        elif engine == "mpi":
+            namespace, group, version, plural = "default", "kubeflow.org", "v2beta1", "mpijobs"
+            log_label = "mpi-job-name"
+            job_name = create_mpi_job(powmin, powmax, job_id)
+        else:
+            raise ValueError("Engine desconhecida. Use 'spark' ou 'mpi'.")
+
+        conn.sendall(f"JOB {job_name} ({engine}) criado. Aguardando conclusão...\n".encode())
+        state = wait_for_completion(job_name, namespace, group, version, plural)
+        
+        logs = get_job_logs(job_name, namespace, log_label)
+        
+        if state in ("COMPLETED", "Succeeded"):
+            # A função de filtro pode ser a mesma se a saída for padronizada
+            conn.sendall(logs.encode())
+        else:
+            conn.sendall(f"\nJob {job_name} falhou com estado '{state}'.\n\n--- LOGS ---\n{logs}".encode())
+
     except Exception as e:
-        conn.sendall(f"[ERRO] Falha no servidor: {e}\n".encode())
+        print(f"[ERRO] no handle_client: {e}")
+        conn.sendall(f"[ERRO NO SERVIDOR] {e}\n".encode())
     finally:
+        if job_name:
+            delete_job(job_name, namespace, group, version, plural)
         conn.close()
         print(f"[-] Desconectado {addr}")
 
