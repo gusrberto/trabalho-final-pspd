@@ -519,6 +519,7 @@ data:
                     // Mostrar loading
                     document.getElementById('summary').innerHTML = '<div class="loading">Carregando métricas...</div>';
                     
+<<<<<<< HEAD
                                     // Dados simulados baseados em métricas reais do ElasticSearch
                 const data = {
                     total_jobs: 8,
@@ -530,12 +531,28 @@ data:
                     time_labels: ['00:45', '00:46', '00:47', '00:48', '00:49', '00:50', '00:51', '00:52'],
                     concurrent_clients: [1, 1, 1, 2, 1, 2, 1, 1]
                 };
+=======
+                    // Dados simulados por enquanto
+                    const data = {
+                        total_jobs: 5,
+                        avg_execution_time: 1500,
+                        success_rate: 0.8,
+                        engines: ['Spark', 'OpenMP', 'MPI'],
+                        engine_counts: [3, 1, 1],
+                        execution_times: [1200, 1800, 2100, 1400, 1600],
+                        time_labels: ['10:00', '11:00', '12:00', '13:00', '14:00']
+                    };
+>>>>>>> b97d729 (melhorando o dasboard)
                     
                     updateSummary(data);
                     updateCharts(data);
                 } catch (error) {
                     console.error('Erro ao carregar métricas:', error);
+<<<<<<< HEAD
                     document.getElementById('summary').innerHTML = '<div class="error">Erro ao carregar métricas: ' + error.message + '</div>';
+=======
+                    document.getElementById('summary').innerHTML = '<div class="error">Erro ao carregar métricas</div>';
+>>>>>>> b97d729 (melhorando o dasboard)
                 }
             }
             
